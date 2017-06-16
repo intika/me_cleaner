@@ -109,7 +109,7 @@ def get_chunks_offsets(llut, me_start):
 
 
 def remove_modules(f, mod_headers, ftpr_offset, me_end):
-    comp_str = ("Uncomp.", "Huffman", "LZMA")
+    comp_str = ("uncomp.", "Huffman", "LZMA")
     unremovable_huff_chunks = []
     chunks_offsets = []
     base = 0
@@ -284,6 +284,113 @@ def relocate_partition(f, me_start, me_end, partition_header_offset,
     return new_offset
 
 
+def check_and_remove_modules(f, me_start, me_end, offset, min_offset,
+                             relocate, keep_modules):
+
+    f.seek(offset + 0x20)
+    num_modules = unpack("<I", f.read(4))[0]
+    f.seek(offset + 0x290)
+    data = f.read(0x84)
+
+    module_header_size = 0
+    if data[0x0:0x4] == b"$MME":
+        if data[0x60:0x64] == b"$MME" or num_modules == 1:
+            module_header_size = 0x60
+        elif data[0x80:0x84] == b"$MME":
+            module_header_size = 0x80
+
+    if module_header_size != 0:
+        f.seek(offset + 0x290)
+        mod_headers = [f.read(module_header_size)
+                       for i in range(0, num_modules)]
+
+        if all(hdr.startswith(b"$MME") for hdr in mod_headers):
+            if args.keep_modules:
+                end_addr = offset + ftpr_lenght
+            else:
+                end_addr = remove_modules(f, mod_headers,
+                                          offset, me_end)
+
+            if args.relocate:
+                new_offset = relocate_partition(f, me_start, me_end,
+                                                me_start + 0x30,
+                                                min_offset + me_start,
+                                                mod_headers)
+                end_addr += new_offset - offset
+                offset = new_offset
+
+            return end_addr, offset
+
+        else:
+            print("Found less modules than expected in the FTPR "
+                  "partition; skipping modules removal")
+    else:
+        print("Can't find the module header size; skipping "
+              "modules removal")
+
+    return -1, offset
+
+
+def check_and_remove_modules_me11(f, me_start, me_end, partition_offset,
+                                  partition_lenght, min_offset, relocate,
+                                  keep_modules):
+
+    comp_str = ("uncomp.", "LZMA", "Huffman")
+    print_metadata_and_manifest_info = True
+
+    if not keep_modules:
+        f.seek(partition_offset + 0x4)
+        module_count = unpack("<I", f.read(4))[0]
+
+        modules = []
+        modules.append(("end", partition_lenght, 0))
+
+        f.seek(partition_offset + 0x10)
+        for i in range(0, module_count):
+            data = f.read(0x18)
+            name = data[0x0:0xc].rstrip(b"\x00").decode("ascii")
+            offset = unpack("<I", data[0xc:0xf] + b"\x00")[0]
+            comp_type = unpack("B", data[0xf])[0]
+
+            modules.append((name, offset, comp_type))
+
+        modules.sort(key=lambda x: x[1])
+
+        for i in range(0, module_count):
+            name = modules[i][0]
+            offset = partition_offset + modules[i][1]
+            end = partition_offset + modules[i + 1][1]
+
+            if print_metadata_and_manifest_info or \
+               not (name.endswith(".met") or name.endswith(".man")):
+                sys.stdout.write(" {:<12} ({:<7}, 0x{:06x} - 0x{:06x}): "
+                                 .format(name, comp_str[modules[i][2]],
+                                         offset, end))
+
+                if any(name.upper().startswith(m) for m in unremovable_modules):
+                    print("NOT removed, essential")
+                elif name.endswith(".man"):
+                    print("NOT removed, partition manifest")
+                elif name.endswith(".met"):
+                    print("NOT removed, module metadata")
+                else:
+                    f.fill_range(me_start + offset, me_start + end, b"\xff")
+                    print("removed")
+
+    if relocate:
+        print("Relocation in ME11 is not implemented yet")
+    else:
+        return partition_offset + partition_lenght, partition_offset    #FIXME
+
+
+def check_mn2_tag(f, offset):
+    f.seek(offset + 0x1c)
+    tag = f.read(4)
+    if tag != b"$MN2":
+        sys.exit("Wrong FTPR manifest tag ({}), this image may be corrupted"
+                 .format(tag))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tool to remove as much code "
                                      "as possible from Intel ME/TXE firmwares")
@@ -381,8 +488,28 @@ if __name__ == "__main__":
     if f.read(4) == b"$CPD":
         me11 = True
         num_entries = unpack("<I", f.read(4))[0]
-        ftpr_mn2_offset = 0x10 + num_entries * 0x18
+
+        f.seek(ftpr_offset + 0x10)
+        ftpr_mn2_offset = -1
+
+        for i in range(0, num_entries):
+            data = f.read(0x18)
+            name = data[0x0:0xc].rstrip(b"\x00").decode("ascii")
+            offset = unpack("<I", data[0xc:0xf] + b"\x00")[0]
+
+            if name == "FTPR.man":
+                ftpr_mn2_offset = offset
+                break
+
+        if ftpr_mn2_offset >= 0:
+            check_mn2_tag(f, ftpr_offset + ftpr_mn2_offset)
+            print("Found FTPR manifest at {:#x}"
+                  .format(ftpr_offset + ftpr_mn2_offset))
+        else:
+            sys.exit("Can't find the manifest of the FTPR partition")
+
     else:
+        check_mn2_tag(f, ftpr_offset)
         me11 = False
         ftpr_mn2_offset = 0
 
@@ -435,71 +562,32 @@ if __name__ == "__main__":
         # must be always 0x00.
         mef.write_to(me_start + 0x1b, pack("B", checksum))
 
-        if not me11:
-            print("Reading FTPR modules list...")
-            mef.seek(ftpr_offset + 0x1c)
-            tag = mef.read(4)
-
-            if tag == b"$MN2":
-                mef.seek(ftpr_offset + 0x20)
-                num_modules = unpack("<I", mef.read(4))[0]
-                mef.seek(ftpr_offset + 0x290)
-                data = mef.read(0x84)
-
-                module_header_size = 0
-                if data[0x0:0x4] == b"$MME":
-                    if data[0x60:0x64] == b"$MME" or num_modules == 1:
-                        module_header_size = 0x60
-                    elif data[0x80:0x84] == b"$MME":
-                        module_header_size = 0x80
-
-                if module_header_size != 0:
-                    mef.seek(ftpr_offset + 0x290)
-                    mod_headers = [mef.read(module_header_size)
-                                   for i in range(0, num_modules)]
-
-                    if all(hdr.startswith(b"$MME") for hdr in mod_headers):
-                        if args.keep_modules:
-                            end_addr = ftpr_offset + ftpr_lenght
-                        else:
-                            end_addr = remove_modules(mef, mod_headers,
-                                                      ftpr_offset, me_end)
-
-                        if args.relocate:
-                            new_ftpr_offset = relocate_partition(mef,
-                                               me_start, me_end,
-                                               me_start + 0x30,
-                                               min_ftpr_offset + me_start,
-                                               mod_headers)
-                            end_addr += new_ftpr_offset - ftpr_offset
-                            ftpr_offset = new_ftpr_offset
-
-                        end_addr = (end_addr // 0x1000 + 1) * 0x1000
-                        end_addr += spared_blocks * 0x1000
-
-                        print("The ME minimum size should be {0} bytes "
-                              "({0:#x} bytes)".format(end_addr - me_start))
-
-                        if me_start > 0:
-                            print("The ME region can be reduced up to:\n"
-                                  " {:08x}:{:08x} me"
-                                  .format(me_start, end_addr - 1))
-                        elif args.truncate:
-                            print("Truncating file at {:#x}..."
-                                  .format(end_addr))
-                            f.truncate(end_addr)
-
-                    else:
-                        print("Found less modules than expected in the FTPR "
-                              "partition; skipping modules removal")
-                else:
-                    print("Can't find the module header size; skipping "
-                          "modules removal")
-            else:
-                print("Wrong FTPR partition tag ({}); skipping modules removal"
-                      .format(tag))
+        print("Reading FTPR modules list...")
+        if me11:
+            end_addr, ftpr_offset = \
+                check_and_remove_modules_me11(mef, me_start, me_end,
+                                              ftpr_offset, ftpr_lenght,
+                                              min_ftpr_offset, args.relocate,
+                                              args.keep_modules)
         else:
-            print("Modules removal in ME v11 or greater is not yet supported")
+            end_addr, ftpr_offset = \
+                check_and_remove_modules(mef, me_start, me_end, ftpr_offset,
+                                         min_ftpr_offset, args.relocate,
+                                         args.keep_modules)
+
+        if end_addr > 0:
+            end_addr = (end_addr // 0x1000 + 1) * 0x1000
+            end_addr += spared_blocks * 0x1000
+
+            print("The ME minimum size should be {0} bytes "
+                  "({0:#x} bytes)".format(end_addr - me_start))
+
+            if me_start > 0:
+                print("The ME region can be reduced up to:\n"
+                      " {:08x}:{:08x} me".format(me_start, end_addr - 1))
+            elif args.truncate:
+                print("Truncating file at {:#x}...".format(end_addr))
+                f.truncate(end_addr)
 
     sys.stdout.write("Checking FTPR RSA signature... ")
     if check_partition_signature(f, ftpr_offset + ftpr_mn2_offset):
@@ -513,3 +601,4 @@ if __name__ == "__main__":
 
     if not args.check:
         print("Done! Good luck!")
+
