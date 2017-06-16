@@ -374,7 +374,7 @@ def check_and_remove_modules_me11(f, me_start, me_end, partition_offset,
                 elif name.endswith(".met"):
                     print("NOT removed, module metadata")
                 else:
-                    f.fill_range(me_start + offset, me_start + end, b"\xff")
+                    f.fill_range(offset, end, b"\xff")
                     print("removed")
 
     if relocate:
