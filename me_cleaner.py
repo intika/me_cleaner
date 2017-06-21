@@ -350,7 +350,7 @@ def check_and_remove_modules_me11(f, me_start, me_end, partition_offset,
             data = f.read(0x18)
             name = data[0x0:0xc].rstrip(b"\x00").decode("ascii")
             offset = unpack("<I", data[0xc:0xf] + b"\x00")[0]
-            comp_type = unpack("B", data[0xf])[0]
+            comp_type = unpack("B", data[0xf:0x10])[0]
 
             modules.append((name, offset, comp_type))
 
